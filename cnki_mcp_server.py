@@ -4,6 +4,7 @@ CNKI MCP Server - CNKI academic paper search via MCP.
 Tools:
 - search_cnki: Search papers (with optional journal filter)
 - get_paper_detail: Get full paper metadata
+- download_paper_pdf: Download paper PDF (requires institutional IP)
 - find_best_match: Find closest title match
 
 Usage:
@@ -22,6 +23,7 @@ import asyncio
 import time
 import random
 import json
+import os
 
 # =================== Search type mappings ===================
 
@@ -430,6 +432,41 @@ async def _get_paper_detail(page: Page, url: str) -> dict:
     return paper
 
 
+# =================== PDF download ===================
+
+async def _download_paper_pdf(page: Page, url: str, save_dir: str) -> dict:
+    """Navigate to a CNKI paper detail page and download the PDF."""
+    # Establish session and navigate to paper page
+    await page.goto("https://www.cnki.net/")
+    await random_delay(1, 2)
+    await page.set_extra_http_headers({"Referer": "https://kns.cnki.net/kns8s/AdvSearch"})
+    await page.goto(url)
+    await random_delay(1.5, 2.5)
+
+    # Find PDF download button
+    pdf_btn = await page.query_selector("a#pdfDown")
+    if not pdf_btn:
+        return {"isError": True, "error": "PDF下载按钮未找到，可能需要机构IP访问权限或该论文不支持PDF下载"}
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Click and wait for download
+    async with page.expect_download(timeout=60000) as download_info:
+        await pdf_btn.click()
+    download = await download_info.value
+
+    suggested_name = download.suggested_filename
+    save_path = os.path.join(save_dir, suggested_name)
+    await download.save_as(save_path)
+
+    return {
+        "url": url,
+        "file_path": save_path,
+        "file_name": suggested_name,
+        "file_size": os.path.getsize(save_path),
+    }
+
+
 # =================== MCP server wiring, tools, resources, entry point ===================
 
 @dataclass
@@ -465,13 +502,20 @@ mcp = FastMCP(
     ### get_paper_detail
     获取论文详情。参数: url（CNKI 论文详情页 URL）
 
+    ### download_paper_pdf
+    下载论文 PDF 文件。参数:
+    - url: CNKI 论文详情页 URL
+    - save_dir: PDF 保存目录的绝对路径
+    需要机构IP访问权限。
+
     ### find_best_match
     查找最匹配的论文标题。参数: query（论文标题）
 
     ## 使用建议
     1. 先用 search_cnki 搜索
     2. 用 get_paper_detail 获取详情
-    3. 用 journal 参数限定期刊范围
+    3. 用 download_paper_pdf 下载 PDF（需机构IP）
+    4. 用 journal 参数限定期刊范围
     """,
 )
 
@@ -545,6 +589,36 @@ async def get_paper_detail(
 
 
 @mcp.tool()
+async def download_paper_pdf(
+    url: Annotated[str, Field(description="CNKI 论文详情页 URL")],
+    save_dir: Annotated[str, Field(description="PDF 保存目录的绝对路径")],
+    ctx: Context,
+    browser_pool: BrowserPool = Depends(get_browser_pool),
+) -> dict:
+    """下载 CNKI 论文 PDF 文件到指定目录。需要机构IP访问权限。"""
+    if not url or "cnki" not in url.lower():
+        return {"isError": True, "error": "URL 必须是 CNKI 链接"}
+
+    await ctx.info(f"下载论文 PDF: {url[:80]}...")
+    await ctx.report_progress(progress=0, total=100)
+
+    page = await browser_pool.get_page()
+    try:
+        result = await _download_paper_pdf(page, url, save_dir)
+    except Exception as e:
+        result = {"isError": True, "error": str(e), "url": url}
+    finally:
+        await page.close()
+
+    await ctx.report_progress(progress=100, total=100)
+    if result.get("isError"):
+        await ctx.error(f"下载失败: {result.get('error')}")
+    else:
+        await ctx.info(f"PDF 已保存: {result.get('file_path')} ({result.get('file_size', 0)} bytes)")
+    return result
+
+
+@mcp.tool()
 async def find_best_match(
     query: Annotated[str, Field(description="论文标题", min_length=1)],
     ctx: Context,
@@ -608,8 +682,8 @@ async def get_server_status(ctx: Context) -> str:
         "server_name": "CNKI 论文检索服务",
         "version": "0.1.0",
         "backend": "Playwright (async)",
-        "tools": ["search_cnki", "get_paper_detail", "find_best_match"],
-        "features": ["journal_filter_via_professional_search", "browser_pool", "idle_timeout"],
+        "tools": ["search_cnki", "get_paper_detail", "download_paper_pdf", "find_best_match"],
+        "features": ["journal_filter_via_professional_search", "pdf_download", "browser_pool", "idle_timeout"],
     }, ensure_ascii=False, indent=2)
 
 
