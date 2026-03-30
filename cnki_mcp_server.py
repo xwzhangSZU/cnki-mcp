@@ -118,20 +118,41 @@ paper_registry = PaperRegistry()
 
 # =================== BrowserPool ===================
 
+CDP_PORT = int(os.environ.get("CNKI_CDP_PORT", "9222"))
+CDP_ENDPOINT = f"http://localhost:{CDP_PORT}"
+
+
 class BrowserPool:
-    """Manages a singleton Playwright browser with idle timeout."""
+    """Manages a singleton Playwright browser with idle timeout.
+
+    优先通过 CDP 连接用户日常 Chrome（零启动、天然绕过验证码），
+    CDP 不可用时 fallback 到 headless Chromium + stealth。
+    """
 
     IDLE_TIMEOUT = 600  # 10 min
 
     def __init__(self):
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
+        self._using_cdp: bool = False
         self._last_used: float = 0
         self._lock = asyncio.Lock()
 
     async def _create_browser(self) -> Browser:
         if self._playwright is None:
             self._playwright = await async_playwright().start()
+
+        # 优先尝试 CDP 连接用户日常 Chrome
+        try:
+            browser = await self._playwright.chromium.connect_over_cdp(CDP_ENDPOINT, timeout=5000)
+            self._using_cdp = True
+            logger.info(f"已通过 CDP 连接到用户 Chrome (port {CDP_PORT})")
+            return browser
+        except Exception as e:
+            logger.info(f"CDP 连接不可用 ({e})，fallback 到 headless Chromium")
+
+        # Fallback: 启动独立 headless Chromium
+        self._using_cdp = False
         browser = await self._playwright.chromium.launch(
             headless=True,
             args=[
@@ -166,20 +187,31 @@ class BrowserPool:
                 self._browser = await self._create_browser()
             self._last_used = now
 
+        # CDP 模式：直接用用户 Chrome 创建新 tab（天然携带指纹和 cookie）
+        if self._using_cdp:
+            ctx = self._browser.contexts[0] if self._browser.contexts else await self._browser.new_context()
+            page = await ctx.new_page()
+            return page
+
+        # Headless 模式：注入 stealth + 随机 UA
         page = await self._browser.new_page(
             user_agent=random.choice(USER_AGENTS),
         )
-        # 注入 stealth 脚本，隐藏 Playwright 自动化特征
         await _stealth.apply_stealth_async(page)
         return page
 
     async def _close_internal(self):
         if self._browser is not None:
             try:
-                await self._browser.close()
+                if self._using_cdp:
+                    # CDP 模式：断开连接但不关闭用户的 Chrome
+                    await self._browser.close()  # disconnect only
+                else:
+                    await self._browser.close()
             except Exception:
                 pass
             self._browser = None
+            self._using_cdp = False
 
     async def close(self):
         async with self._lock:
