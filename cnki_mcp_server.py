@@ -18,6 +18,7 @@ from fastmcp.dependencies import Depends, CurrentContext
 from typing import List, Optional, Annotated
 from pydantic import Field
 from playwright.async_api import async_playwright, Browser, Page, Playwright
+from playwright_stealth import Stealth
 from dataclasses import dataclass
 from contextlib import asynccontextmanager
 import asyncio
@@ -26,6 +27,14 @@ import random
 import json
 import os
 import re
+import logging
+
+logger = logging.getLogger("cnki-mcp")
+
+_stealth = Stealth(
+    navigator_languages_override=("zh-CN", "zh", "en-US", "en"),
+    navigator_platform_override="MacIntel",
+)
 
 # =================== Search type mappings ===================
 
@@ -160,9 +169,8 @@ class BrowserPool:
         page = await self._browser.new_page(
             user_agent=random.choice(USER_AGENTS),
         )
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        """)
+        # 注入 stealth 脚本，隐藏 Playwright 自动化特征
+        await _stealth.apply_stealth_async(page)
         return page
 
     async def _close_internal(self):
@@ -182,6 +190,37 @@ class BrowserPool:
             except Exception:
                 pass
             self._playwright = None
+
+
+# =================== CAPTCHA Detection ===================
+
+async def _check_and_handle_captcha(page: Page, target_url: str, max_retries: int = 1) -> bool:
+    """检测 CNKI 验证码拦截，如果被拦截则尝试重新导航。
+
+    Returns True if page is ready, False if still blocked.
+    """
+    current_url = page.url
+    if "/verify/" not in current_url and "captcha" not in current_url.lower():
+        return True  # 没有被拦截
+
+    logger.warning(f"CNKI 触发了验证码拦截，当前 URL: {current_url}")
+
+    for attempt in range(max_retries):
+        # 等待一段时间后重试
+        await asyncio.sleep(2)
+        await page.goto(target_url, timeout=30000)
+        await asyncio.sleep(3)
+
+        new_url = page.url
+        if "/verify/" not in new_url and "captcha" not in new_url.lower():
+            logger.info("验证码拦截已解除")
+            return True
+
+    logger.error(
+        "CNKI 验证码拦截未能自动解除。"
+        "请在浏览器中手动访问 https://www.cnki.net/ 并完成滑块验证后重试。"
+    )
+    return False
 
 
 # =================== Helpers ===================
@@ -312,8 +351,12 @@ async def _simple_search(page: Page, query: str, search_type: str, sort: str, pa
     resolved_type = resolve_search_type(search_type)
     resolved_sort = resolve_sort_type(sort)
 
-    await page.goto("https://www.cnki.net/")
+    await page.goto("https://www.cnki.net/", timeout=30000)
     await random_delay(1, 2)
+
+    # 检测是否触发验证码
+    if not await _check_and_handle_captcha(page, "https://www.cnki.net/"):
+        return {"error": "CNKI 触发验证码拦截，请在浏览器中手动访问 https://www.cnki.net/ 完成滑块验证后重试。", "papers": []}
 
     if resolved_type != "主题":
         value = SEARCH_TYPE_VALUES.get(resolved_type)
@@ -396,14 +439,22 @@ async def _professional_search(page: Page, query: str, search_type: str, journal
         expr += f" AND {journal_expr}"
 
     # Visit main site first for session cookies
-    await page.goto("https://www.cnki.net/")
+    await page.goto("https://www.cnki.net/", timeout=30000)
     await random_delay(1, 2)
 
-    await page.goto("https://kns.cnki.net/kns8s/AdvSearch")
+    # 检测主站是否触发验证码
+    if not await _check_and_handle_captcha(page, "https://www.cnki.net/"):
+        return {"error": "CNKI 触发验证码拦截，请在浏览器中手动访问 https://www.cnki.net/ 完成滑块验证后重试。", "papers": []}
+
+    await page.goto("https://kns.cnki.net/kns8s/AdvSearch", timeout=30000)
     await random_delay(1, 2)
+
+    # 检测高级搜索页是否触发验证码
+    if not await _check_and_handle_captcha(page, "https://kns.cnki.net/kns8s/AdvSearch"):
+        return {"error": "CNKI 触发验证码拦截，请在浏览器中手动访问 https://www.cnki.net/ 完成滑块验证后重试。", "papers": []}
 
     # Click Professional Search tab
-    await page.click('li[name="majorSearch"]')
+    await page.click('li[name="majorSearch"]', timeout=10000)
     await random_delay(0.5, 1)
 
     # Enter expression
