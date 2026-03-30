@@ -118,8 +118,53 @@ paper_registry = PaperRegistry()
 
 # =================== BrowserPool ===================
 
-CDP_PORT = int(os.environ.get("CNKI_CDP_PORT", "9222"))
-CDP_ENDPOINT = f"http://localhost:{CDP_PORT}"
+def _discover_cdp_ws_url() -> Optional[str]:
+    """从 Chrome DevToolsActivePort 文件自动发现 CDP WebSocket URL。
+
+    Chrome 通过 chrome://inspect 开启远程调试时，不走固定端口的 HTTP /json/version，
+    而是在 DevToolsActivePort 文件中写入端口和带 UUID 的 WebSocket 路径。
+    """
+    import platform as _platform
+    home = os.path.expanduser("~")
+    system = _platform.system()
+
+    candidates = []
+    if system == "Darwin":
+        candidates = [
+            os.path.join(home, "Library/Application Support/Google/Chrome/DevToolsActivePort"),
+            os.path.join(home, "Library/Application Support/Google/Chrome Canary/DevToolsActivePort"),
+            os.path.join(home, "Library/Application Support/Chromium/DevToolsActivePort"),
+        ]
+    elif system == "Linux":
+        candidates = [
+            os.path.join(home, ".config/google-chrome/DevToolsActivePort"),
+            os.path.join(home, ".config/chromium/DevToolsActivePort"),
+        ]
+    elif system == "Windows":
+        local = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            os.path.join(local, "Google/Chrome/User Data/DevToolsActivePort"),
+            os.path.join(local, "Chromium/User Data/DevToolsActivePort"),
+        ]
+
+    for fpath in candidates:
+        try:
+            content = open(fpath).read().strip()
+            lines = content.split("\n")
+            port = int(lines[0])
+            ws_path = lines[1] if len(lines) > 1 else ""
+            if port > 0 and ws_path:
+                url = f"ws://localhost:{port}{ws_path}"
+                logger.info(f"从 DevToolsActivePort 发现 CDP: {url}")
+                return url
+        except Exception:
+            continue
+
+    # Fallback: 尝试环境变量指定的端口（标准 HTTP 发现）
+    cdp_port = os.environ.get("CNKI_CDP_PORT")
+    if cdp_port:
+        return f"http://localhost:{cdp_port}"
+    return None
 
 
 class BrowserPool:
@@ -143,13 +188,15 @@ class BrowserPool:
             self._playwright = await async_playwright().start()
 
         # 优先尝试 CDP 连接用户日常 Chrome
-        try:
-            browser = await self._playwright.chromium.connect_over_cdp(CDP_ENDPOINT, timeout=5000)
-            self._using_cdp = True
-            logger.info(f"已通过 CDP 连接到用户 Chrome (port {CDP_PORT})")
-            return browser
-        except Exception as e:
-            logger.info(f"CDP 连接不可用 ({e})，fallback 到 headless Chromium")
+        cdp_url = _discover_cdp_ws_url()
+        if cdp_url:
+            try:
+                browser = await self._playwright.chromium.connect_over_cdp(cdp_url, timeout=5000)
+                self._using_cdp = True
+                logger.info(f"已通过 CDP 连接到用户 Chrome: {cdp_url}")
+                return browser
+            except Exception as e:
+                logger.info(f"CDP 连接失败 ({e})，fallback 到 headless Chromium")
 
         # Fallback: 启动独立 headless Chromium
         self._using_cdp = False
