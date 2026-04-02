@@ -183,22 +183,51 @@ class BrowserPool:
         self._last_used: float = 0
         self._lock = asyncio.Lock()
 
+    CDP_MAX_RETRIES = 3
+    CDP_RETRY_DELAY = 2  # seconds
+
     async def _create_browser(self) -> Browser:
         if self._playwright is None:
             self._playwright = await async_playwright().start()
 
-        # 优先尝试 CDP 连接用户日常 Chrome
-        cdp_url = _discover_cdp_ws_url()
-        if cdp_url:
-            try:
-                browser = await self._playwright.chromium.connect_over_cdp(cdp_url, timeout=5000)
-                self._using_cdp = True
-                logger.info(f"已通过 CDP 连接到用户 Chrome: {cdp_url}")
-                return browser
-            except Exception as e:
-                logger.info(f"CDP 连接失败 ({e})，fallback 到 headless Chromium")
+        # 强制 CDP 模式：多次重试，不再静默 fallback 到 headless
+        # 用户的 Chrome 有机构访问权限和 cookies，headless 没有
+        require_cdp = os.environ.get("CNKI_ALLOW_HEADLESS", "").lower() not in ("1", "true", "yes")
 
-        # Fallback: 启动独立 headless Chromium
+        last_error = None
+        for attempt in range(self.CDP_MAX_RETRIES):
+            cdp_url = _discover_cdp_ws_url()
+            if cdp_url:
+                try:
+                    browser = await self._playwright.chromium.connect_over_cdp(cdp_url, timeout=8000)
+                    self._using_cdp = True
+                    self._cdp_url = cdp_url
+                    logger.info(f"已通过 CDP 连接到用户 Chrome: {cdp_url}")
+                    return browser
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"CDP 连接尝试 {attempt+1}/{self.CDP_MAX_RETRIES} 失败: {e}")
+            else:
+                last_error = "DevToolsActivePort 文件不存在或无法读取"
+                logger.warning(f"CDP 发现尝试 {attempt+1}/{self.CDP_MAX_RETRIES}: {last_error}")
+
+            if attempt < self.CDP_MAX_RETRIES - 1:
+                await asyncio.sleep(self.CDP_RETRY_DELAY)
+
+        if require_cdp:
+            raise RuntimeError(
+                f"CDP 连接失败（重试 {self.CDP_MAX_RETRIES} 次）: {last_error}\n"
+                "CNKI MCP 需要连接你的 Chrome 浏览器才能使用机构访问权限。\n"
+                "请确保：\n"
+                "  1. Chrome 已打开\n"
+                "  2. 启动时使用了 --remote-debugging-port 参数，"
+                "或通过 chrome://inspect 开启了调试\n"
+                "  3. 已登录 CNKI 机构账号\n"
+                "如确实需要 headless 模式，设置环境变量 CNKI_ALLOW_HEADLESS=1"
+            )
+
+        # 仅当 CNKI_ALLOW_HEADLESS=1 时才走 headless fallback
+        logger.warning("CDP 不可用，fallback 到 headless Chromium（无机构访问权限）")
         self._using_cdp = False
         browser = await self._playwright.chromium.launch(
             headless=True,
@@ -217,19 +246,48 @@ class BrowserPool:
         if self._browser is None:
             return False
         try:
-            return self._browser.is_connected()
+            if not self._browser.is_connected():
+                return False
+            # CDP 模式下，is_connected() 可能返回 True 但实际连接已失效
+            # 尝试打开一个空白页作为健康检查
+            if self._using_cdp:
+                ctx = self._browser.contexts[0] if self._browser.contexts else None
+                if ctx is None:
+                    return False
+                test_page = await ctx.new_page()
+                await test_page.close()
+            return True
         except Exception:
             return False
 
     async def get_page(self) -> Page:
-        """Get a new page from the browser (caller must close it)."""
+        """Get a new page from the browser (caller must close it).
+
+        每次获取页面时都会检查连接状态：
+        - CDP 模式：检测端口漂移（Chrome 重启）
+        - Headless 模式：重新探测 CDP，可用则切换（升级到用户 Chrome）
+        """
         async with self._lock:
             now = time.time()
             if self._browser is not None:
                 if now - self._last_used > self.IDLE_TIMEOUT:
                     await self._close_internal()
                 elif not await self._is_browser_alive():
+                    logger.info("浏览器连接已失效，重新创建")
                     self._browser = None
+                elif self._using_cdp:
+                    # CDP 模式下检测端口漂移（Chrome 重启后端口变化）
+                    new_cdp = _discover_cdp_ws_url()
+                    if new_cdp and hasattr(self, '_cdp_url') and new_cdp != self._cdp_url:
+                        logger.info(f"CDP 端口漂移: {self._cdp_url} → {new_cdp}，重连")
+                        await self._close_internal()
+                elif not self._using_cdp:
+                    # Headless 模式下，每次请求重新探测 CDP
+                    # 如果用户后来打开了 Chrome，立即升级到 CDP 模式
+                    new_cdp = _discover_cdp_ws_url()
+                    if new_cdp:
+                        logger.info(f"发现 CDP 可用 ({new_cdp})，从 headless 升级到 CDP 模式")
+                        await self._close_internal()
             if self._browser is None:
                 self._browser = await self._create_browser()
             self._last_used = now
@@ -341,9 +399,22 @@ async def random_delay(lo: float = 1.0, hi: float = 2.5):
     await asyncio.sleep(random.uniform(lo, hi))
 
 
+async def _dismiss_top_banner(page: Page):
+    """关闭 CNKI 首页顶部广告横幅，避免遮挡搜索框。"""
+    try:
+        close_btn = page.locator("a.close-adv")
+        if await close_btn.count() > 0 and await close_btn.is_visible():
+            await close_btn.click()
+            await asyncio.sleep(0.3)
+    except Exception:
+        pass
+
+
 async def type_slowly(page: Page, selector: str, text: str):
     """Type text character by character to mimic human input."""
+    await _dismiss_top_banner(page)
     locator = page.locator(selector)
+    await locator.wait_for(state="visible", timeout=15000)
     await locator.clear()
     for char in text:
         await locator.press_sequentially(char, delay=random.uniform(30, 80))
@@ -773,7 +844,7 @@ def _enrich_bibtex(bibtex_raw: str, paper: dict) -> str:
 
 # =================== PDF download ===================
 
-async def _download_paper_pdf(page: Page, url: str, save_dir: str) -> dict:
+async def _download_paper_pdf(page: Page, url: str, save_dir: str, using_cdp: bool = False) -> dict:
     """Navigate to a CNKI paper detail page and download the PDF."""
     # Establish session and navigate to paper page
     await page.goto("https://www.cnki.net/")
@@ -789,7 +860,65 @@ async def _download_paper_pdf(page: Page, url: str, save_dir: str) -> dict:
 
     os.makedirs(save_dir, exist_ok=True)
 
-    # Click and wait for download
+    if using_cdp:
+        # CDP 模式：expect_download 无法捕获 Chrome 原生下载事件。
+        # 改为：获取 PDF URL → 用页面 cookies 通过 HTTP 直接下载。
+        pdf_href = await pdf_btn.get_attribute("href")
+        if not pdf_href:
+            # 尝试点击后捕获新标签的 URL
+            async with page.context.expect_page(timeout=15000) as new_page_info:
+                await pdf_btn.click()
+            new_page = await new_page_info.value
+            await new_page.wait_for_load_state("domcontentloaded", timeout=15000)
+            pdf_href = new_page.url
+            await new_page.close()
+
+        if not pdf_href:
+            return {"isError": True, "error": "CDP 模式下无法获取 PDF URL"}
+
+        # 补全相对 URL
+        if pdf_href.startswith("/"):
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            pdf_href = f"{parsed.scheme}://{parsed.netloc}{pdf_href}"
+
+        # 从页面提取 cookies
+        cookies = await page.context.cookies()
+        cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+
+        # 用 urllib 下载（不引入额外依赖）
+        import urllib.request
+        req = urllib.request.Request(pdf_href)
+        req.add_header("Cookie", cookie_header)
+        req.add_header("Referer", url)
+        req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+
+        # 从 URL 或 Content-Disposition 推断文件名
+        resp = urllib.request.urlopen(req, timeout=60)
+        cd = resp.headers.get("Content-Disposition", "")
+        if "filename=" in cd:
+            fname = re.search(r'filename[*]?=["\']?([^"\';]+)', cd)
+            suggested_name = fname.group(1) if fname else "paper.pdf"
+        else:
+            suggested_name = pdf_href.split("/")[-1].split("?")[0] or "paper.pdf"
+        if not suggested_name.endswith(".pdf"):
+            suggested_name += ".pdf"
+
+        # 用 urllib.parse.unquote 解码文件名
+        from urllib.parse import unquote
+        suggested_name = unquote(suggested_name)
+
+        save_path = os.path.join(save_dir, suggested_name)
+        with open(save_path, "wb") as f:
+            f.write(resp.read())
+
+        return {
+            "file_path": save_path,
+            "file_name": suggested_name,
+            "file_size": os.path.getsize(save_path),
+        }
+
+    # Headless 模式：原有逻辑
     async with page.expect_download(timeout=60000) as download_info:
         await pdf_btn.click()
     download = await download_info.value
@@ -961,7 +1090,7 @@ async def download_paper_pdf(
 
     page = await browser_pool.get_page()
     try:
-        result = await _download_paper_pdf(page, url, save_dir)
+        result = await _download_paper_pdf(page, url, save_dir, using_cdp=browser_pool._using_cdp)
     except Exception as e:
         result = {"isError": True, "error": str(e), "paper": paper}
     finally:
