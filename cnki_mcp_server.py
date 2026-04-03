@@ -559,34 +559,42 @@ def _build_field_expr(field_code: str, query: str) -> str:
         return f"{field_code}={parts}"
 
 
-async def _professional_search(page: Page, query: str, search_type: str, journal: Optional[str], sort: str, pages: int, author: Optional[str] = None) -> dict:
+async def _professional_search(page: Page, query: str, search_type: str, journal: Optional[str], sort: str, pages: int, author: Optional[str] = None, raw_expr: Optional[str] = None) -> dict:
     """Search via CNKI Professional Search (with journal/author filter).
 
     Journal names use exact match (LY=), topics use fuzzy match (SU%),
     authors use exact match (AU=).
     Multiple terms in query are joined with * (AND) per CNKI syntax.
     Multiple journals can be separated by '+', e.g. '经济研究+管理世界'.
+
+    If raw_expr is provided, it is used directly as the professional search
+    expression, bypassing automatic construction from query/author/journal.
     """
-    resolved_type = resolve_search_type(search_type)
     resolved_sort = resolve_sort_type(sort)
-    field_code = PROFESSIONAL_SEARCH_FIELDS.get(resolved_type, "SU")
 
-    # Build expression: start with the main query field
-    expr = _build_field_expr(field_code, query)
+    if raw_expr:
+        # Use the raw expression directly — caller is responsible for syntax
+        expr = raw_expr
+    else:
+        resolved_type = resolve_search_type(search_type)
+        field_code = PROFESSIONAL_SEARCH_FIELDS.get(resolved_type, "SU")
 
-    # Add author filter if provided
-    if author:
-        expr += f" AND AU='{author}'"
+        # Build expression: start with the main query field
+        expr = _build_field_expr(field_code, query)
 
-    # Add journal filter if provided
-    # Multiple journals: (LY='j1' OR LY='j2')
-    if journal:
-        journals = [j.strip() for j in journal.split("+") if j.strip()]
-        if len(journals) == 1:
-            journal_expr = f"LY='{journals[0]}'"
-        else:
-            journal_expr = "(" + " OR ".join(f"LY='{j}'" for j in journals) + ")"
-        expr += f" AND {journal_expr}"
+        # Add author filter if provided
+        if author:
+            expr += f" AND AU='{author}'"
+
+        # Add journal filter if provided
+        # Multiple journals: (LY='j1' OR LY='j2')
+        if journal:
+            journals = [j.strip() for j in journal.split("+") if j.strip()]
+            if len(journals) == 1:
+                journal_expr = f"LY='{journals[0]}'"
+            else:
+                journal_expr = "(" + " OR ".join(f"LY='{j}'" for j in journals) + ")"
+            expr += f" AND {journal_expr}"
 
     # Visit main site first for session cookies
     await page.goto("https://www.cnki.net/", timeout=30000)
@@ -1010,24 +1018,38 @@ async def search_cnki(
     journal: Annotated[Optional[str], Field(
         description="限定期刊名称（精确匹配），如'经济研究'。多个期刊用+分隔，如'经济研究+管理世界'。设置后使用专业检索。"
     )] = None,
+    expert_query: Annotated[Optional[str], Field(
+        description="CNKI 专业检索式，直接输入完整表达式。设置后忽略 query/search_type/author/journal，直接在专业检索框执行。"
+                    "语法：字段代码='值'，* = AND，+ = OR，- = NOT。"
+                    "字段代码：SU=主题，TI=篇名，KY=关键词，AB=摘要，FT=全文，AU=作者，FI=第一作者，LY=来源（期刊名）。"
+                    "示例：SU='数据跨境' * SU='安全化' AND (LY='台湾研究' + LY='台湾研究集刊')。"
+                    "可结合年份：SU='个人信息' AND YE>='2020' AND YE<='2026'。"
+    )] = None,
     pages: Annotated[int, Field(description="搜索页数", ge=1, le=10)] = 1,
     sort: Annotated[str, Field(
         description="排序: 相关度/发表时间/被引/下载/综合 (英文: relevance/date/cited/download/composite)"
     )] = "相关度",
     browser_pool: BrowserPool = Depends(get_browser_pool),
 ) -> dict:
-    """搜索 CNKI 论文，返回论文列表。支持通过 author 和 journal 参数分别筛选作者和期刊。
+    """搜索 CNKI 论文，返回论文列表。支持三种模式：
 
-    重要：query 参数只放主题/关键词/篇名，不要把作者名混入 query。
-    如需按作者搜索，请使用 author 参数。author 和 query 可组合使用。
-    示例：搜索张三关于经济增长的论文 → query='经济增长', author='张三'
+    1. 简单搜索：只传 query（自动选择普通搜索）
+    2. 筛选搜索：传 query + author/journal（自动切换专业检索）
+    3. 专业检索：传 expert_query（直接输入完整检索式，最灵活）
+
+    简单搜索示例：query='经济增长'
+    筛选搜索示例：query='经济增长', author='张三', journal='经济研究'
+    专业检索示例：expert_query="SU='数据跨境' * SU='台湾' AND YE>='2022'"
     """
-    await ctx.info(f"搜索 CNKI: query='{query}', author={author}, journal={journal}")
+    mode = "expert" if expert_query else ("professional" if (journal or author) else "simple")
+    await ctx.info(f"搜索 CNKI [{mode}]: query='{query}', expert_query={expert_query!r}, author={author}, journal={journal}")
     await ctx.report_progress(progress=0, total=100)
 
     page = await browser_pool.get_page()
     try:
-        if journal or author:
+        if expert_query:
+            result = await _professional_search(page, query, search_type, journal, sort, pages, raw_expr=expert_query)
+        elif journal or author:
             result = await _professional_search(page, query, search_type, journal, sort, pages, author=author)
         else:
             result = await _simple_search(page, query, search_type, sort, pages)
@@ -1209,7 +1231,7 @@ async def get_server_status(ctx: Context) -> str:
         "version": "0.1.0",
         "backend": "Playwright (async)",
         "tools": ["search_cnki", "get_paper_detail", "get_paper_bibtex", "download_paper_pdf", "find_best_match"],
-        "features": ["journal_filter_via_professional_search", "bibtex_export", "pdf_download", "browser_pool", "idle_timeout"],
+        "features": ["journal_filter_via_professional_search", "expert_query_direct_input", "bibtex_export", "pdf_download", "browser_pool", "idle_timeout"],
     }, ensure_ascii=False, indent=2)
 
 
