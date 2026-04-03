@@ -559,7 +559,163 @@ def _build_field_expr(field_code: str, query: str) -> str:
         return f"{field_code}={parts}"
 
 
-async def _professional_search(page: Page, query: str, search_type: str, journal: Optional[str], sort: str, pages: int, author: Optional[str] = None, raw_expr: Optional[str] = None) -> dict:
+async def _select_database_type(page: Page, doc_type: str) -> bool:
+    """在 CNKI 高级检索页面选择数据库类型（如 学术期刊、学位论文 等）。
+
+    CNKI kns8s AdvSearch 页面的数据库切换是 ul.doctype-menus 下的
+    <a name="classify" resource="JOURNAL"> 等链接，点击后页面重新加载为对应数据库模式。
+    """
+    # 标准化 doc_type → 显示文本 + resource 属性
+    type_map = {
+        "期刊": ("学术期刊", "JOURNAL"), "journal": ("学术期刊", "JOURNAL"),
+        "journals": ("学术期刊", "JOURNAL"), "学术期刊": ("学术期刊", "JOURNAL"),
+        "cjfq": ("学术期刊", "JOURNAL"),
+        "学位论文": ("学位论文", None), "dissertation": ("学位论文", None),
+        "thesis": ("学位论文", None),
+        "会议": ("会议", None), "conference": ("会议", None),
+        "报纸": ("报纸", None), "newspaper": ("报纸", None),
+    }
+    mapped = type_map.get(doc_type.strip().lower())
+    if mapped:
+        target_text, target_resource = mapped
+    else:
+        target_text, target_resource = doc_type.strip(), None
+
+    try:
+        # 策略1（首选）：通过 resource 属性直接定位，最精准
+        if target_resource:
+            loc = page.locator(f'ul.doctype-menus a[name="classify"][resource="{target_resource}"]').first
+            if await loc.count() > 0:
+                await loc.click()
+                await random_delay(1.5, 2.5)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    await random_delay(1, 2)
+                logger.info(f"已选择数据库类型: {target_text} (策略1: resource={target_resource})")
+                return True
+
+        # 策略2：在 doctype-menus 中按文本匹配
+        nav_links = await page.query_selector_all('ul.doctype-menus a[name="classify"]')
+        for link in nav_links:
+            text = (await link.inner_text()).strip()
+            if target_text in text:
+                # 跳过 display:none 的父元素
+                parent = await link.query_selector('xpath=..')
+                if parent:
+                    style = await parent.get_attribute('style') or ''
+                    if 'display: none' in style or 'display:none' in style:
+                        continue
+                await link.click()
+                await random_delay(1.5, 2.5)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    await random_delay(1, 2)
+                logger.info(f"已选择数据库类型: {target_text} (策略2: doctype-menus 文本匹配)")
+                return True
+
+        # 策略3：兜底 — 在 doctype-list 中查找已选中项或可点击项
+        list_links = await page.query_selector_all('ul.doctype-list li')
+        for li in list_links:
+            text = (await li.inner_text()).strip()
+            if target_text in text:
+                await li.click()
+                await random_delay(1.5, 2.5)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    await random_delay(1, 2)
+                logger.info(f"已选择数据库类型: {target_text} (策略3: doctype-list)")
+                return True
+
+        logger.warning(f"未找到数据库类型导航: {target_text}")
+        return False
+    except Exception as e:
+        logger.warning(f"选择数据库类型失败: {e}")
+        return False
+
+
+async def _apply_source_category_filter(page: Page, source_category: str) -> bool:
+    """在 CNKI 高级检索页面勾选来源类别 checkbox（如 CSSCI、北大核心 等）。
+
+    必须在搜索提交之前调用。CNKI kns8s AdvSearch 页面的来源类别结构：
+    <div class="extend-tit-checklist">
+      <div class="extend-tit-labels">
+        <label><input name="all" type="checkbox" checked="">全部期刊</label>
+        <label><input type="checkbox" key="CSI" value="Y">CSSCI</label>
+        ...
+      </div>
+    </div>
+    """
+    # 标准化映射：用户输入 → (checkbox key 属性, 显示文本)
+    category_map = {
+        "cssci": ("CSI", "CSSCI"),
+        "cscd": ("CSD", "CSCD"),
+        "北大核心": ("HX", "北大核心"),
+        "核心期刊": ("HX", "北大核心"),
+        "sci": ("SI", "SCI来源期刊"),
+        "sci来源期刊": ("SI", "SCI来源期刊"),
+        "ei": ("EI", "EI来源期刊"),
+        "ei来源期刊": ("EI", "EI来源期刊"),
+        "wjci": ("LYBSM", "WJCI"),
+        "ami": ("AMI", "AMI"),
+        "cssci扩展版": ("CSI", "CSSCI"),  # fallback to CSSCI
+    }
+    normalized = source_category.strip().lower()
+    mapped = category_map.get(normalized)
+    if not mapped:
+        logger.warning(f"未知的来源类别: {source_category}")
+        return False
+
+    target_key, target_text = mapped
+
+    try:
+        # 策略1（首选）：通过 key 属性精确定位 checkbox
+        checkbox = page.locator(f'.extend-tit-labels input[type="checkbox"][key="{target_key}"]').first
+        if await checkbox.count() > 0:
+            # 先取消"全部期刊"的勾选（如果它被选中）
+            all_checkbox = page.locator('.extend-tit-labels input[name="all"]').first
+            if await all_checkbox.count() > 0:
+                is_checked = await all_checkbox.is_checked()
+                if is_checked:
+                    await all_checkbox.click()
+                    await random_delay(0.3, 0.5)
+
+            # 勾选目标类别
+            is_checked = await checkbox.is_checked()
+            if not is_checked:
+                await checkbox.click()
+                await random_delay(0.3, 0.5)
+            logger.info(f"已勾选来源类别: {target_text} (策略1: key={target_key})")
+            return True
+
+        # 策略2：在 extend-tit-labels 中按文本匹配 label
+        labels = await page.query_selector_all('.extend-tit-labels label')
+        for label in labels:
+            text = (await label.inner_text()).strip()
+            if target_text in text or source_category.strip().upper() in text.upper():
+                # 先取消"全部期刊"
+                all_checkbox = page.locator('.extend-tit-labels input[name="all"]').first
+                if await all_checkbox.count() > 0 and await all_checkbox.is_checked():
+                    await all_checkbox.click()
+                    await random_delay(0.3, 0.5)
+
+                cb = await label.query_selector('input[type="checkbox"]')
+                if cb and not await cb.is_checked():
+                    await cb.click()
+                    await random_delay(0.3, 0.5)
+                logger.info(f"已勾选来源类别: {target_text} (策略2: 文本匹配)")
+                return True
+
+        logger.warning(f"未找到来源类别 checkbox: {source_category}")
+        return False
+    except Exception as e:
+        logger.warning(f"勾选来源类别失败: {e}")
+        return False
+
+
+async def _professional_search(page: Page, query: str, search_type: str, journal: Optional[str], sort: str, pages: int, author: Optional[str] = None, affiliation: Optional[str] = None, raw_expr: Optional[str] = None, source_category: Optional[str] = None, doc_type: Optional[str] = None) -> dict:
     """Search via CNKI Professional Search (with journal/author filter).
 
     Journal names use exact match (LY=), topics use fuzzy match (SU%),
@@ -575,6 +731,7 @@ async def _professional_search(page: Page, query: str, search_type: str, journal
     if raw_expr:
         # Use the raw expression directly — caller is responsible for syntax
         expr = raw_expr
+        resolved_type = "专业检索"
     else:
         resolved_type = resolve_search_type(search_type)
         field_code = PROFESSIONAL_SEARCH_FIELDS.get(resolved_type, "SU")
@@ -585,6 +742,10 @@ async def _professional_search(page: Page, query: str, search_type: str, journal
         # Add author filter if provided
         if author:
             expr += f" AND AU='{author}'"
+
+        # Add affiliation filter if provided (fuzzy match with %)
+        if affiliation:
+            expr += f" AND AF%'{affiliation}'"
 
         # Add journal filter if provided
         # Multiple journals: (LY='j1' OR LY='j2')
@@ -610,6 +771,16 @@ async def _professional_search(page: Page, query: str, search_type: str, journal
     # 检测高级搜索页是否触发验证码
     if not await _check_and_handle_captcha(page, "https://kns.cnki.net/kns8s/AdvSearch"):
         return {"error": "CNKI 触发验证码拦截，请在浏览器中手动访问 https://www.cnki.net/ 完成滑块验证后重试。", "papers": []}
+
+    # 选择数据库类型（如"学术期刊"），必须在切换到专业检索之前完成
+    db_type_applied = False
+    if doc_type:
+        db_type_applied = await _select_database_type(page, doc_type)
+
+    # 勾选来源类别（如 CSSCI），必须在搜索提交之前完成
+    filter_applied = False
+    if source_category:
+        filter_applied = await _apply_source_category_filter(page, source_category)
 
     # Click Professional Search tab
     await page.click('li[name="majorSearch"]', timeout=10000)
@@ -644,6 +815,12 @@ async def _professional_search(page: Page, query: str, search_type: str, journal
         result["author"] = author
     if journal:
         result["journal"] = journal
+    if doc_type:
+        result["doc_type"] = doc_type
+        result["doc_type_applied"] = db_type_applied
+    if source_category:
+        result["source_category"] = source_category
+        result["source_category_applied"] = filter_applied
     return result
 
 
@@ -1015,6 +1192,11 @@ async def search_cnki(
     author: Annotated[Optional[str], Field(
         description="按作者筛选（可与 query 组合使用）。例如搜索某作者关于某主题的论文：query='经济增长', author='张三'。设置后自动使用专业检索。"
     )] = None,
+    affiliation: Annotated[Optional[str], Field(
+        description="按作者单位/机构筛选（模糊匹配），如'清华大学'、'北京大学'。"
+                    "可与 author 组合使用，如 author='程啸', affiliation='清华大学'。"
+                    "设置后自动使用专业检索。"
+    )] = None,
     journal: Annotated[Optional[str], Field(
         description="限定期刊名称（精确匹配），如'经济研究'。多个期刊用+分隔，如'经济研究+管理世界'。设置后使用专业检索。"
     )] = None,
@@ -1022,8 +1204,22 @@ async def search_cnki(
         description="CNKI 专业检索式，直接输入完整表达式。设置后忽略 query/search_type/author/journal，直接在专业检索框执行。"
                     "语法：字段代码='值'，* = AND，+ = OR，- = NOT。"
                     "字段代码：SU=主题，TI=篇名，KY=关键词，AB=摘要，FT=全文，AU=作者，FI=第一作者，LY=来源（期刊名）。"
-                    "示例：SU='数据跨境' * SU='安全化' AND (LY='台湾研究' + LY='台湾研究集刊')。"
+                    "示例：SU='数据跨境' * '安全化' AND (LY='台湾研究' + LY='台湾研究集刊')。"
+                    "注意：* 运算符后的项不要重复字段码，如 SU='A' * 'B'（正确）vs SU='A' * SU='B'（错误，返回0条）。"
+                    "跨字段用 AND：SU='A' AND TI='B'。OR 用括号：SU='A' * ('B' + 'C')。"
                     "可结合年份：SU='个人信息' AND YE>='2020' AND YE<='2026'。"
+    )] = None,
+    doc_type: Annotated[Optional[str], Field(
+        description="限定文献类型/数据库。在高级检索页顶部导航栏选择对应数据库后再搜索。"
+                    "可选值：期刊（学术期刊）、学位论文、会议、报纸。"
+                    "重要：使用 source_category（如 CSSCI）筛选时，必须先设置 doc_type='期刊'，"
+                    "否则混合数据库下 CSSCI 筛选不可用。"
+    )] = None,
+    source_category: Annotated[Optional[str], Field(
+        description="来源类别筛选，在搜索结果页左侧边栏点击对应类别。"
+                    "可选值：CSSCI、核心期刊、SCI、EI、CSCD、CSSCI扩展版 等。"
+                    "仅在使用专业检索或筛选检索时生效（需先有搜索结果页）。"
+                    "注意：必须配合 doc_type='期刊' 使用，否则在总库模式下不可用。"
     )] = None,
     pages: Annotated[int, Field(description="搜索页数", ge=1, le=10)] = 1,
     sort: Annotated[str, Field(
@@ -1041,16 +1237,16 @@ async def search_cnki(
     筛选搜索示例：query='经济增长', author='张三', journal='经济研究'
     专业检索示例：expert_query="SU='数据跨境' * SU='台湾' AND YE>='2022'"
     """
-    mode = "expert" if expert_query else ("professional" if (journal or author) else "simple")
-    await ctx.info(f"搜索 CNKI [{mode}]: query='{query}', expert_query={expert_query!r}, author={author}, journal={journal}")
+    mode = "expert" if expert_query else ("professional" if (journal or author or affiliation or source_category or doc_type) else "simple")
+    await ctx.info(f"搜索 CNKI [{mode}]: query='{query}', expert_query={expert_query!r}, author={author}, affiliation={affiliation}, journal={journal}, doc_type={doc_type}, source_category={source_category}")
     await ctx.report_progress(progress=0, total=100)
 
     page = await browser_pool.get_page()
     try:
         if expert_query:
-            result = await _professional_search(page, query, search_type, journal, sort, pages, raw_expr=expert_query)
-        elif journal or author:
-            result = await _professional_search(page, query, search_type, journal, sort, pages, author=author)
+            result = await _professional_search(page, query, search_type, journal, sort, pages, raw_expr=expert_query, source_category=source_category, doc_type=doc_type)
+        elif journal or author or affiliation or source_category or doc_type:
+            result = await _professional_search(page, query, search_type, journal, sort, pages, author=author, affiliation=affiliation, source_category=source_category, doc_type=doc_type)
         else:
             result = await _simple_search(page, query, search_type, sort, pages)
     except Exception as e:
