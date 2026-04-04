@@ -715,7 +715,7 @@ async def _apply_source_category_filter(page: Page, source_category: str) -> boo
         return False
 
 
-async def _professional_search(page: Page, query: str, search_type: str, journal: Optional[str], sort: str, pages: int, author: Optional[str] = None, affiliation: Optional[str] = None, raw_expr: Optional[str] = None, source_category: Optional[str] = None, doc_type: Optional[str] = None) -> dict:
+async def _professional_search(page: Page, query: str, search_type: str, journal: Optional[str], sort: str, pages: int, author: Optional[str] = None, raw_expr: Optional[str] = None, source_category: Optional[str] = None, doc_type: Optional[str] = None) -> dict:
     """Search via CNKI Professional Search (with journal/author filter).
 
     Journal names use exact match (LY=), topics use fuzzy match (SU%),
@@ -742,10 +742,6 @@ async def _professional_search(page: Page, query: str, search_type: str, journal
         # Add author filter if provided
         if author:
             expr += f" AND AU='{author}'"
-
-        # Add affiliation filter if provided (fuzzy match with %)
-        if affiliation:
-            expr += f" AND AF%'{affiliation}'"
 
         # Add journal filter if provided
         # Multiple journals: (LY='j1' OR LY='j2')
@@ -1184,30 +1180,42 @@ def get_browser_pool(ctx: Context = CurrentContext()) -> BrowserPool:
 
 @mcp.tool()
 async def search_cnki(
-    query: Annotated[str, Field(description="搜索关键词（主题/篇名等，不要把作者名放在这里，请用 author 参数）。多个关键词用空格分隔，会自动用 AND 连接，如'北京 奥运'→SU='北京' * '奥运'", min_length=1)],
     ctx: Context,
+    query: Annotated[str, Field(description="搜索关键词（主题/篇名等，不要把作者名放在这里，请用 author 参数）。多个关键词用空格分隔，会自动用 AND 连接，如'北京 奥运'→SU='北京' * '奥运'。使用 expert_query 时可留空。")] = "",
     search_type: Annotated[str, Field(
         description="搜索类型: 主题/关键词/篇名/DOI (英文: subject/keyword/title/doi)。注意：按作者筛选请用 author 参数而非设置 search_type='作者'"
     )] = "主题",
     author: Annotated[Optional[str], Field(
         description="按作者筛选（可与 query 组合使用）。例如搜索某作者关于某主题的论文：query='经济增长', author='张三'。设置后自动使用专业检索。"
     )] = None,
-    affiliation: Annotated[Optional[str], Field(
-        description="按作者单位/机构筛选（模糊匹配），如'清华大学'、'北京大学'。"
-                    "可与 author 组合使用，如 author='程啸', affiliation='清华大学'。"
-                    "设置后自动使用专业检索。"
-    )] = None,
     journal: Annotated[Optional[str], Field(
         description="限定期刊名称（精确匹配），如'经济研究'。多个期刊用+分隔，如'经济研究+管理世界'。设置后使用专业检索。"
     )] = None,
     expert_query: Annotated[Optional[str], Field(
         description="CNKI 专业检索式，直接输入完整表达式。设置后忽略 query/search_type/author/journal，直接在专业检索框执行。"
-                    "语法：字段代码='值'，* = AND，+ = OR，- = NOT。"
-                    "字段代码：SU=主题，TI=篇名，KY=关键词，AB=摘要，FT=全文，AU=作者，FI=第一作者，LY=来源（期刊名）。"
-                    "示例：SU='数据跨境' * '安全化' AND (LY='台湾研究' + LY='台湾研究集刊')。"
-                    "注意：* 运算符后的项不要重复字段码，如 SU='A' * 'B'（正确）vs SU='A' * SU='B'（错误，返回0条）。"
-                    "跨字段用 AND：SU='A' AND TI='B'。OR 用括号：SU='A' * ('B' + 'C')。"
-                    "可结合年份：SU='个人信息' AND YE>='2020' AND YE<='2026'。"
+                    "\n\n【语法三层体系】"
+                    "\n1. 逻辑运算符（跨字段）：AND / OR / NOT，前后需空格"
+                    "\n2. 复合运算符（同字段内多词）：* (与) / + (或) / - (非)"
+                    "\n3. 匹配运算符：= (精确) / % (分词/模糊) / %= (相关匹配，仅SU)"
+                    "\n\n【字段代码】"
+                    "\nSU=主题, TKA=篇关摘, TI=篇名, KY=关键词, AB=摘要, FT=全文, "
+                    "AU=作者, FI=第一作者, RP=通讯作者, AF=作者单位, LY=文献来源（期刊名）, "
+                    "FU=基金, RF=参考文献, YE=年, CF=被引频次, CLC=分类号, DOI=DOI"
+                    "\n\n【匹配运算符选择规则】"
+                    "\n- TI/AB/FT 多词搜索：必须用 %（分词匹配），不要用 =。"
+                    "\n  TI % '关键词1' * '关键词2' ✅    TI = '关键词1' * '关键词2' ❌"
+                    "\n- SU 主题搜索：用 %=（相关匹配）。SU %= '大数据' ✅"
+                    "\n- AU/LY/KY/AF 等：用 =（精确匹配）。AU = '张三' ✅"
+                    "\n- 期刊字段：用 LY（不是 JN）。LY = '中国法学' ✅"
+                    "\n\n【正确示例】"
+                    "\n1. AU = '熊伟' AND TI % '国家创新体系' * '财税法' AND LY = '现代法学'"
+                    "\n2. SU %= '数据跨境' * '安全' AND YE >= '2022'"
+                    "\n3. AU = '张三' AND (AF = '清华大学' OR AF = '北京大学')"
+                    "\n4. TI % '人工智能' * '教育' NOT TI = '综述'"
+                    "\n\n【注意事项】"
+                    "\n- * 运算符后不要重复字段码：SU='A' * 'B'（正确）vs SU='A' * SU='B'（错误，返回0条）"
+                    "\n- 跨字段用 AND：SU='A' AND TI='B'。OR 用括号：SU='A' * ('B' + 'C')"
+                    "\n- 可结合年份：SU='个人信息' AND YE>='2020' AND YE<='2026'"
     )] = None,
     doc_type: Annotated[Optional[str], Field(
         description="限定文献类型/数据库。在高级检索页顶部导航栏选择对应数据库后再搜索。"
@@ -1235,18 +1243,26 @@ async def search_cnki(
 
     简单搜索示例：query='经济增长'
     筛选搜索示例：query='经济增长', author='张三', journal='经济研究'
-    专业检索示例：expert_query="SU='数据跨境' * SU='台湾' AND YE>='2022'"
+    专业检索示例：expert_query="AU = '熊伟' AND TI % '财税法' * '创新体系' AND LY = '现代法学'"
+
+    【专业检索要点】
+    - TI（篇名）多词搜索必须用 %（分词匹配），不用 =
+    - 期刊字段用 LY，不用 JN
+    - 主题字段用 SU %=（相关匹配）
+    - 值用单引号括起来，运算符前后留空格
     """
-    mode = "expert" if expert_query else ("professional" if (journal or author or affiliation or source_category or doc_type) else "simple")
-    await ctx.info(f"搜索 CNKI [{mode}]: query='{query}', expert_query={expert_query!r}, author={author}, affiliation={affiliation}, journal={journal}, doc_type={doc_type}, source_category={source_category}")
+    if not query and not expert_query:
+        return {"isError": True, "error": "必须提供 query 或 expert_query 之一", "papers": []}
+    mode = "expert" if expert_query else ("professional" if (journal or author or source_category or doc_type) else "simple")
+    await ctx.info(f"搜索 CNKI [{mode}]: query='{query}', expert_query={expert_query!r}, author={author}, journal={journal}, doc_type={doc_type}, source_category={source_category}")
     await ctx.report_progress(progress=0, total=100)
 
     page = await browser_pool.get_page()
     try:
         if expert_query:
             result = await _professional_search(page, query, search_type, journal, sort, pages, raw_expr=expert_query, source_category=source_category, doc_type=doc_type)
-        elif journal or author or affiliation or source_category or doc_type:
-            result = await _professional_search(page, query, search_type, journal, sort, pages, author=author, affiliation=affiliation, source_category=source_category, doc_type=doc_type)
+        elif journal or author or source_category or doc_type:
+            result = await _professional_search(page, query, search_type, journal, sort, pages, author=author, source_category=source_category, doc_type=doc_type)
         else:
             result = await _simple_search(page, query, search_type, sort, pages)
     except Exception as e:
