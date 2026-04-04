@@ -1213,9 +1213,9 @@ async def search_cnki(
                     "\n3. AU = '张三' AND (AF = '清华大学' OR AF = '北京大学')"
                     "\n4. TI % '人工智能' * '教育' NOT TI = '综述'"
                     "\n\n【注意事项】"
-                    "\n- * 运算符后不要重复字段码：SU='A' * 'B'（正确）vs SU='A' * SU='B'（错误，返回0条）"
-                    "\n- 跨字段用 AND：SU='A' AND TI='B'。OR 用括号：SU='A' * ('B' + 'C')"
-                    "\n- 可结合年份：SU='个人信息' AND YE>='2020' AND YE<='2026'"
+                    "\n- * 运算符后不要重复字段码：SU %= 'A' * 'B'（正确）vs SU %= 'A' * SU %= 'B'（错误）"
+                    "\n- 跨字段用 AND：SU %= 'A' AND TI % 'B'。同字段内用 + 表示或：SU %= 'A' * ('B' + 'C')"
+                    "\n- 可结合年份：SU %= '个人信息' AND YE >= '2020' AND YE <= '2026'"
     )] = None,
     doc_type: Annotated[Optional[str], Field(
         description="限定文献类型/数据库。在高级检索页顶部导航栏选择对应数据库后再搜索。"
